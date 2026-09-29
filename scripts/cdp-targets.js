@@ -22,6 +22,11 @@ const APP_CN = /\/WorkBuddy\.app(?:\/|$)/i;
 const APP_AI = /\/WorkBuddy AI\.app(?:\/|$)/i;
 const APP_CBCN = /\/CodeBuddy CN\.app(?:\/|$)/i;
 const APP_CBINTL = /\/CodeBuddy\.app(?:\/|$)/i;
+// Linux 没有 .app 包：渲染进程页面来自应用安装目录里的 resources（如
+// file:///opt/WorkBuddy/resources/app.asar/...）。海外版是复制到 XDG 数据目录的应用副本，
+// 路径形如 ~/.local/share/workbuddy-ai/app/workbuddy/...，必须先于 CN 规则判定。
+const APP_AI_LINUX = /\/workbuddy-ai\//i;
+const APP_CN_LINUX = /\/opt\/WorkBuddy\//i;
 const DOMAIN_WB_AI = /https?:\/\/(?:[^/]+\.)?workbuddy\.ai(?:\/|$)/i;
 const DOMAIN_WB_CN = /https?:\/\/(?:[^/]+\.)?workbuddy\.cn(?:\/|$)/i;
 const DOMAIN_CB_CN = /https?:\/\/(?:[^/]+\.)?codebuddy\.cn(?:\/|$)/i;
@@ -36,7 +41,9 @@ const DOMAIN_CB_AI = /https?:\/\/(?:[^/]+\.)?codebuddy\.ai(?:\/|$)/i;
 function classifyTarget(url, title, description) {
   const u = normalizeTargetUrl(url);
   if (APP_AI.test(u)) return 'workbuddy-ai';
+  if (APP_AI_LINUX.test(u)) return 'workbuddy-ai';
   if (APP_CN.test(u)) return 'workbuddy-cn';
+  if (APP_CN_LINUX.test(u)) return 'workbuddy-cn';
   if (APP_CBCN.test(u)) return 'codebuddy-cn';
   if (APP_CBINTL.test(u)) return 'codebuddy-intl';
   if (DOMAIN_WB_AI.test(u)) return 'workbuddy-ai';
@@ -61,6 +68,8 @@ function looksLikeWbFamilyTarget(target) {
   const u = normalizeTargetUrl(url);
   return (
     /\/CodeBuddy(?: CN)?\.app(?:\/|$)/i.test(u) ||
+    APP_CN_LINUX.test(u) ||
+    APP_AI_LINUX.test(u) ||
     /^vscode-/i.test(url) ||
     /codebuddy/i.test(haystack) ||
     /^WorkBuddy(?:\s|$)/i.test(title)
@@ -78,6 +87,19 @@ function isTargetForProfile(target, profile) {
   const title = String(target.title || '');
   const desc = String(target.description || '');
   const haystack = `${url} ${title} ${desc}`;
+
+  // 企业专享版沿用 CN/AI 的 UI 能力，但应用路径和登录域均由用户选择后生成。
+  // 企业模式只接受它自己的精确信号，不再回落到官方域名或通用标题。
+  if (profile.customTarget) {
+    const signals = [];
+    try { if (profile.apiHost) signals.push(new URL(profile.apiHost).hostname.toLowerCase()); } catch (_) {}
+    for (const hint of profile.targetHints || []) {
+      const value = String(hint || '').trim().toLowerCase();
+      if (value.length >= 4) signals.push(value);
+    }
+    const lower = haystack.toLowerCase();
+    return signals.some((signal) => lower.includes(signal));
+  }
 
   // 强信号：页面明确属于某客户端 → 必须与当前 profile 一致，否则一律拒绝
   const cls = classifyTarget(url, title, desc);
@@ -99,4 +121,25 @@ function isTargetForProfile(target, profile) {
   return false;
 }
 
-module.exports = { normalizeTargetUrl, classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile };
+/**
+ * Pick the renderer page for WorkDaddy injection. WorkBuddy can expose a
+ * separate settings utility window before the main conversation page; that
+ * window shares the same app URL and must not become the CDP session target.
+ */
+function selectPageTarget(targets, profile) {
+  const candidates = (Array.isArray(targets) ? targets : []).filter((target) => {
+    if (!isTargetForProfile(target, profile)) return false;
+    // CodeBuddy's standalone Agents window is distinct from the IDE and its
+    // extension webviews. Wait for that window instead of attaching to the IDE.
+    return profile.kind !== 'codebuddy' || /\/agentManager\.html(?:[?#]|$)/i.test(String(target.url || ''));
+  });
+  const score = (target) => {
+    const url = String(target && target.url || '');
+    if (/windowAppId=settings|windowKind=settings|windowPreset=utility/i.test(url)) return 20;
+    if (/accountSnapshot=|[?&]locale=/i.test(url)) return 0;
+    return 10;
+  };
+  return candidates.sort((a, b) => score(a) - score(b))[0] || null;
+}
+
+module.exports = { normalizeTargetUrl, classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageTarget };
